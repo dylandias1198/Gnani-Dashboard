@@ -321,25 +321,34 @@ def add_period_labels(tdf, time_grp):
     return tdf
 
 
-def create_trend_chart(tc):
+def create_trend_chart(tc, time_grp='daily'):
+    periods = tc['Period'].tolist()
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=tc['Period'], y=tc['Count'], mode='lines+markers', name='Cases',
+        x=periods, y=tc['Count'], mode='lines+markers', name='Cases',
         line=dict(color='#6366F1', width=3, shape='linear'),
         marker=dict(size=8, color='#6366F1', line=dict(color='white', width=2)),
         hovertemplate='<b>%{x}</b><br>%{y:,} cases<extra></extra>',
     ))
-    fig.update_layout(**base_layout(height=320, showlegend=False))
+    layout = base_layout(height=320, showlegend=False)
+    layout['uirevision'] = f'trend-{time_grp}-{"|".join(periods)}'
+    fig.update_layout(**layout)
     fig.update_xaxes(
         type='category',
-        tickangle=-30 if len(tc) > 6 else 0,
+        tickangle=-30 if len(periods) > 6 else 0,
         categoryorder='array',
-        categoryarray=tc['Period'].tolist(),
+        categoryarray=periods,
     )
+    if time_grp == 'monthly' and len(periods) == 1:
+        fig.add_annotation(
+            text='Single month in range — switch to Daily for day-by-day detail',
+            xref='paper', yref='paper', x=0.5, y=1.08, showarrow=False,
+            font=dict(size=11, color='#94A3B8', family=FONT),
+        )
     return style_axes(fig, x_grid=False, y_grid=True)
 
 
-def create_status_line_chart(tc):
+def create_status_line_chart(tc, time_grp='daily'):
     period_order = tc.drop_duplicates('_sort').sort_values('_sort')
     periods = period_order['Period'].tolist()
     line_statuses = [s for s in ['SUCCESS', 'FAILED'] if s in tc['Overall Status'].unique()]
@@ -375,6 +384,7 @@ def create_status_line_chart(tc):
 
     fig.update_layout(
         **base_layout(height=340, showlegend=True),
+        uirevision=f'status-{time_grp}-{"|".join(periods)}',
         legend=dict(
             title='',
             orientation='h',
@@ -784,16 +794,15 @@ app.layout = html.Div([
             ]),
             html.Div([
                 html.Label('Time Grouping', className='filter-label'),
-                dcc.RadioItems(
+                dcc.Dropdown(
                     id='time-grouping',
                     options=[
                         {'label': 'Daily', 'value': 'daily'},
                         {'label': 'Monthly', 'value': 'monthly'},
                     ],
                     value='daily',
-                    className='pill-toggle',
-                    inputClassName='pill-input',
-                    labelClassName='pill-label',
+                    clearable=False,
+                    style=dropdown_style,
                 ),
             ]),
             html.Div([
@@ -1000,7 +1009,7 @@ def update_dash(data, status, time_grp, start_date, end_date):
                 tdf = add_period_labels(tdf, time_grp)
                 tc = tdf.groupby(['_sort', 'Period']).size().reset_index(name='Count')
                 tc = tc.sort_values('_sort')
-                trend = create_trend_chart(tc)
+                trend = create_trend_chart(tc, time_grp)
             else:
                 trend = create_empty_fig()
         else:
@@ -1012,7 +1021,7 @@ def update_dash(data, status, time_grp, start_date, end_date):
                 tdf = add_period_labels(tdf, time_grp)
                 tc = tdf.groupby(['_sort', 'Period', 'Overall Status']).size().reset_index(name='Count')
                 tc = tc.sort_values('_sort')
-                tbar = create_status_line_chart(tc)
+                tbar = create_status_line_chart(tc, time_grp)
             else:
                 tbar = create_empty_fig()
         else:
