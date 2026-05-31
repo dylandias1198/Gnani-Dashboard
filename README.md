@@ -25,6 +25,40 @@ Open http://127.0.0.1:8050
 
 Alternatively, import the repo using the included `render.yaml` blueprint.
 
+## Deploy with GitHub Actions
+
+GitHub cannot run a Dash server itself. Actions can **test your code** and **trigger a deploy** to Render on every push to `main`.
+
+### One-time setup
+
+1. **Create the Render service** (steps above) so the app exists at a public URL.
+2. In Render, open your service → **Settings** → **Deploy Hook** → copy the hook URL.
+3. On GitHub, open **Gnani-Dashboard** → **Settings** → **Secrets and variables** → **Actions**.
+4. Click **New repository secret**:
+   - Name: `RENDER_DEPLOY_HOOK`
+   - Value: paste the Render deploy hook URL
+5. Push to `main`. Actions runs automatically.
+
+### Workflows in this repo
+
+| Workflow | What it does |
+|----------|----------------|
+| `ci.yml` | Installs deps and verifies `dashboard.py` imports (on push/PR) |
+| `deploy-render.yml` | Runs tests, then POSTs to Render deploy hook |
+
+View runs: **GitHub repo → Actions** tab.
+
+### Push workflow files with your PAT
+
+```bash
+cd /Users/dylan.dias/PycharmProjects/gnanni
+git add .github/workflows/
+git commit -m "Add GitHub Actions for CI and Render deploy"
+git push origin main
+```
+
+Use GitHub username + PAT (`ghp_...`) when prompted for password.
+
 ## CSV format
 
 The dashboard expects columns such as:
