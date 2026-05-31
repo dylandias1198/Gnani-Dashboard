@@ -382,9 +382,10 @@ def create_status_line_chart(tc, time_grp='daily'):
             hovertemplate=f'<b>%{{x}}</b><br>{label}: %{{customdata:,}} (%{{y:.1f}}%)<extra></extra>',
         ))
 
+    layout = base_layout(height=340, showlegend=True)
+    layout['uirevision'] = f'status-{time_grp}-{"|".join(periods)}'
     fig.update_layout(
-        **base_layout(height=340, showlegend=True),
-        uirevision=f'status-{time_grp}-{"|".join(periods)}',
+        **layout,
         legend=dict(
             title='',
             orientation='h',
