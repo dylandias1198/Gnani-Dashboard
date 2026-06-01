@@ -56,9 +56,13 @@ def parse_last_updated(series):
         '%Y-%m-%d %H:%M:%S',
         '%Y-%m-%d %H:%M',
         '%Y-%m-%d',
+        '%Y-%m-%dT%H:%M:%S',
+        '%Y-%m-%dT%H:%M:%S.%f',
         '%d/%m/%Y %H:%M:%S',
         '%d/%m/%Y %H:%M',
         '%d/%m/%Y',
+        '%d-%m-%Y %H:%M:%S',
+        '%d-%m-%Y',
         '%m/%d/%Y %H:%M:%S',
         '%m/%d/%Y %H:%M',
         '%m/%d/%Y',
@@ -70,7 +74,13 @@ def parse_last_updated(series):
         remaining = parsed.isna() & s.notna()
 
     if remaining.any():
-        fallback = pd.to_datetime(s[remaining], errors='coerce', dayfirst=True)
+        try:
+            fallback = pd.to_datetime(s[remaining], format='mixed', errors='coerce')
+        except (ValueError, TypeError):
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', category=UserWarning)
+                fallback = pd.to_datetime(s[remaining], format='ISO8601', errors='coerce')
         parsed.loc[remaining] = fallback
 
     return parsed
