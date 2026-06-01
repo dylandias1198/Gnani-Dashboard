@@ -9,7 +9,7 @@ import os
 
 FONT = "Plus Jakarta Sans"
 CHART_PALETTE = ['#6366F1', '#8B5CF6', '#06B6D4', '#10B981', '#F59E0B', '#EC4899']
-STATUS_COLORS = {'SUCCESS': '#6366F1', 'FAILED': '#EC4899', 'PENDING': '#06B6D4'}
+STATUS_COLORS = {'SUCCESS': '#10B981', 'FAILED': '#EC4899', 'PENDING': '#06B6D4'}
 STATUS_LABELS = {'SUCCESS': 'Success', 'FAILED': 'Failed', 'PENDING': 'Pending'}
 SF_HIERARCHY = {
     'problem': 'SF Final Problem',
@@ -43,6 +43,99 @@ def parse_contents(contents, filename):
         return df, filename, None
     except Exception as e:
         return None, filename, str(e)
+
+
+def parse_last_updated(series):
+    """Parse Last Updated (IST) using explicit formats to avoid pandas warnings."""
+    s = series.astype(str).str.strip()
+    s = s.mask(s.isin(['', 'nan', 'None', 'NaT', 'NaN']))
+    parsed = pd.Series(pd.NaT, index=s.index, dtype='datetime64[ns]')
+    remaining = s.notna()
+
+    for fmt in (
+        '%Y-%m-%d %H:%M:%S',
+        '%Y-%m-%d %H:%M',
+        '%Y-%m-%d',
+        '%d/%m/%Y %H:%M:%S',
+        '%d/%m/%Y %H:%M',
+        '%d/%m/%Y',
+        '%m/%d/%Y %H:%M:%S',
+        '%m/%d/%Y %H:%M',
+        '%m/%d/%Y',
+    ):
+        if not remaining.any():
+            break
+        attempt = pd.to_datetime(s[remaining], format=fmt, errors='coerce')
+        parsed.loc[remaining] = parsed.loc[remaining].fillna(attempt)
+        remaining = parsed.isna() & s.notna()
+
+    if remaining.any():
+        fallback = pd.to_datetime(s[remaining], errors='coerce', dayfirst=True)
+        parsed.loc[remaining] = fallback
+
+    return parsed
+
+
+def add_date_column(df):
+    if 'Last Updated (IST)' in df.columns:
+        df = df.copy()
+        df['Date'] = parse_last_updated(df['Last Updated (IST)'])
+    return df
+
+
+def data_date_bounds(df):
+    if 'Date' not in df.columns:
+        return None, None
+    valid = df['Date'].dropna()
+    if valid.empty:
+        return None, None
+    return valid.min().date().isoformat(), valid.max().date().isoformat()
+
+
+def resolve_date_range(df, start_date, end_date, use_full_data_range=False):
+    data_min, data_max = data_date_bounds(df)
+    if not data_min or not data_max:
+        return start_date, end_date
+    if use_full_data_range or not start_date or not end_date:
+        return data_min, data_max
+    return start_date, end_date
+
+
+def apply_global_filters(df, status, start_date, end_date):
+    fdf = df.copy()
+    if status != 'ALL' and 'Overall Status' in fdf.columns:
+        fdf = fdf[fdf['Overall Status'] == status]
+    if start_date and end_date and 'Date' in fdf.columns:
+        start = pd.to_datetime(start_date).normalize()
+        end = pd.to_datetime(end_date).normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+        in_range = fdf['Date'].isna() | ((fdf['Date'] >= start) & (fdf['Date'] <= end))
+        fdf = fdf[in_range]
+    return fdf
+
+
+def prepare_filtered_df(data, status, start_date, end_date, use_full_data_range=False):
+    df = add_date_column(pd.DataFrame(data))
+    start_date, end_date = resolve_date_range(df, start_date, end_date, use_full_data_range)
+    return df, apply_global_filters(df, status, start_date, end_date), start_date, end_date
+
+
+def data_just_loaded():
+    from dash import ctx
+    if not ctx.triggered:
+        return True
+    return any(item['prop_id'].startswith('stored-data.') for item in ctx.triggered)
+
+
+def analysis_message(total_rows, filtered_rows):
+    if filtered_rows >= total_rows:
+        return html.Div(f"Analyzing {filtered_rows:,} cases", className='alert alert-success')
+    return html.Div([
+        html.Div(f"Analyzing {filtered_rows:,} of {total_rows:,} loaded cases", className='alert alert-success'),
+        html.Div(
+            'Some rows are hidden by the date or status filter. Reset the date range to include all rows.',
+            style={'marginTop': '4px', 'fontSize': '12px'},
+        ),
+    ], className='alert alert-success')
 
 
 def base_layout(**kwargs):
@@ -223,15 +316,134 @@ def column_options(series):
     return [{'label': 'All', 'value': 'ALL'}] + [{'label': v, 'value': v} for v in sorted(vals)]
 
 
-def apply_global_filters(df, status, start_date, end_date):
-    fdf = df.copy()
-    if status != 'ALL' and 'Overall Status' in fdf.columns:
-        fdf = fdf[fdf['Overall Status'] == status]
-    if start_date and end_date and 'Date' in fdf.columns:
-        start = pd.to_datetime(start_date).normalize()
-        end = pd.to_datetime(end_date).normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
-        fdf = fdf[fdf['Date'].notna() & (fdf['Date'] >= start) & (fdf['Date'] <= end)]
-    return fdf
+def compute_stats(fdf):
+    tot = len(fdf)
+    succ = len(fdf[fdf['Overall Status'] == 'SUCCESS']) if 'Overall Status' in fdf.columns else 0
+    fail = len(fdf[fdf['Overall Status'] == 'FAILED']) if 'Overall Status' in fdf.columns else 0
+    unres = len(fdf[fdf['SF Final Action'] == 'Unresolved']) if 'SF Final Action' in fdf.columns else 0
+    sr = f"{(succ / tot * 100):.1f}%" if tot > 0 else "0%"
+    return tot, sr, fail, unres, succ
+
+
+def build_all_figures(fdf, time_grp):
+    if 'Date' in fdf.columns:
+        tdf = fdf[fdf['Date'].notna()].copy()
+        if len(tdf) > 0:
+            tdf = add_period_labels(tdf, time_grp)
+            tc = tdf.groupby(['_sort', 'Period']).size().reset_index(name='Count')
+            tc = tc.sort_values('_sort')
+            trend = create_trend_chart(tc, time_grp)
+        else:
+            trend = create_empty_fig()
+    else:
+        trend = create_empty_fig()
+
+    if 'Date' in fdf.columns and 'Overall Status' in fdf.columns:
+        tdf = fdf[fdf['Date'].notna()].copy()
+        if len(tdf) > 0:
+            tdf = add_period_labels(tdf, time_grp)
+            tc = tdf.groupby(['_sort', 'Period', 'Overall Status']).size().reset_index(name='Count')
+            tc = tc.sort_values('_sort')
+            tbar = create_status_line_chart(tc, time_grp)
+        else:
+            tbar = create_empty_fig()
+    else:
+        tbar = create_empty_fig()
+
+    if 'Overall Status' in fdf.columns:
+        c = fdf['Overall Status'].value_counts()
+        status_colors = [STATUS_COLORS.get(k, CHART_PALETTE[i % len(CHART_PALETTE)]) for i, k in enumerate(c.index)]
+        spie = create_donut_chart(c.to_dict(), colors=status_colors, center_label='Cases')
+    else:
+        spie = create_empty_fig()
+
+    if 'CTA Status' in fdf.columns:
+        cpie = create_donut_chart(fdf['CTA Status'].value_counts().to_dict(), center_label='CTA')
+    else:
+        cpie = create_empty_fig()
+
+    if 'SF Final Category' in fdf.columns:
+        c = fdf['SF Final Category'].value_counts().head(10)
+        catbar = create_horizontal_bar(c.values, c.index, '#6366F1', '#818CF8')
+    else:
+        catbar = create_empty_fig()
+
+    if 'SF Final Problem' in fdf.columns:
+        c = fdf['SF Final Problem'].value_counts().head(10)
+        pbar = create_horizontal_bar(c.values, c.index, '#8B5CF6', '#A78BFA')
+    else:
+        pbar = create_empty_fig()
+
+    if 'SF Final Action' in fdf.columns:
+        res = len(fdf[fdf['SF Final Action'] == 'Resolved'])
+        unr = len(fdf[fdf['SF Final Action'] == 'Unresolved'])
+        resbar = create_resolution_donut(res, unr)
+    else:
+        resbar = create_empty_fig()
+
+    if 'SF Error Type' in fdf.columns:
+        e = fdf['SF Error Type'].dropna().value_counts().head(10)
+        ebar = create_error_bar(e) if len(e) > 0 else create_empty_fig()
+    else:
+        ebar = create_empty_fig()
+
+    return trend, tbar, spie, cpie, catbar, pbar, resbar, ebar
+
+
+CHART_TITLES = [
+    'Cases Trend',
+    'Status Distribution',
+    'Overall Status',
+    'CTA Status',
+    'SF Final Categories',
+    'SF Final Problems',
+    'Resolution Status',
+    'Error Types',
+]
+
+
+def generate_report_pdf(data, status, time_grp, start_date, end_date):
+    from datetime import datetime
+    from report_service import build_pdf_report, fig_to_png
+
+    if data is None:
+        raise ValueError('Upload data before generating a report.')
+
+    df, fdf, start_date, end_date = prepare_filtered_df(
+        data, status, start_date, end_date, use_full_data_range=False,
+    )
+    if len(fdf) == 0:
+        raise ValueError('No data matches current filters.')
+
+    tot, sr, fail, unres, succ = compute_stats(fdf)
+    figures = build_all_figures(fdf, time_grp)
+    charts = []
+    for title, fig in zip(CHART_TITLES, figures):
+        try:
+            charts.append((title, fig_to_png(fig)))
+        except Exception:
+            continue
+
+    if not charts:
+        raise ValueError('Could not generate chart images for PDF.')
+
+    summary = {
+        'generated_at': datetime.now().strftime('%b %d, %Y %H:%M'),
+        'metrics': [
+            ('Total Cases', f'{tot:,}'),
+            ('Success Rate', sr),
+            ('Successful Cases', f'{succ:,}'),
+            ('Failed Cases', f'{fail:,}'),
+            ('Unresolved', f'{unres:,}'),
+        ],
+    }
+    filters = {
+        'Status': status if status != 'ALL' else 'All',
+        'Time Grouping': time_grp.title(),
+        'Date Range': f'{start_date or "—"} to {end_date or "—"}',
+    }
+    filename = f"gnani-dashboard-report-{datetime.now().strftime('%Y%m%d-%H%M')}.pdf"
+    return build_pdf_report(summary, charts, filters), filename
 
 
 def create_hierarchy_bar(fdf, group_by, problem_f, detail_f, subdetail_f):
@@ -459,7 +671,23 @@ app.index_string = """
                 padding: 28px 20px; z-index: 1000;
                 border-right: 1px solid rgba(255,255,255,0.06);
                 box-shadow: 4px 0 24px rgba(15, 23, 42, 0.15);
+                display: flex; flex-direction: column;
             }
+            .sidebar-inner { display: flex; flex-direction: column; flex: 1; min-height: calc(100vh - 56px); }
+            .sidebar-actions { margin-top: auto; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.08); }
+            .email-btn, .download-btn {
+                width: 100%; border: none; background: rgba(99, 102, 241, 0.18); color: #E0E7FF;
+                cursor: pointer; text-align: left; margin-bottom: 8px;
+            }
+            .email-btn:hover, .download-btn:hover { background: rgba(99, 102, 241, 0.28); color: #FFFFFF; }
+            .download-btn { background: rgba(16, 185, 129, 0.18); color: #A7F3D0; }
+            .download-btn:hover { background: rgba(16, 185, 129, 0.28); color: #FFFFFF; }
+            .email-btn:disabled, .download-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+            .email-status, .report-status {
+                margin-top: 10px; font-size: 11px; line-height: 1.4; color: #94A3B8;
+            }
+            .email-status.success, .report-status.success { color: #6EE7B7; }
+            .email-status.error, .report-status.error { color: #FCA5A5; }
             .logo-section { padding-bottom: 36px; border-bottom: 1px solid rgba(255,255,255,0.08); margin-bottom: 28px; }
             .logo-container { display: flex; align-items: center; gap: 12px; }
             .logo-icon {
@@ -714,23 +942,38 @@ def chart_card(title, subtitle, graph_id, full_width=False):
 
 app.layout = html.Div([
     dcc.Store(id='stored-data'),
+    dcc.Download(id='download-report'),
     html.Div([
         html.Div([
             html.Div([
-                html.Div('G', className='logo-icon'),
                 html.Div([
-                    html.Div('Gnani', className='logo-text'),
-                    html.Div('Analytics', className='logo-sub'),
-                ]),
-            ], className='logo-container'),
-        ], className='logo-section'),
-        html.Div([
-            html.Div('Navigation', className='menu-label'),
+                    html.Div('G', className='logo-icon'),
+                    html.Div([
+                        html.Div('Gnani', className='logo-text'),
+                        html.Div('Analytics', className='logo-sub'),
+                    ]),
+                ], className='logo-container'),
+            ], className='logo-section'),
             html.Div([
-                html.I(className='fas fa-chart-line'),
-                html.Span('Dashboard'),
-            ], className='menu-item active'),
-        ], className='menu-section'),
+                html.Div('Navigation', className='menu-label'),
+                html.Div([
+                    html.I(className='fas fa-chart-line'),
+                    html.Span('Dashboard'),
+                ], className='menu-item active'),
+            ], className='menu-section'),
+            html.Div([
+                html.Div('Report', className='menu-label'),
+                html.Button([
+                    html.I(className='fas fa-download'),
+                    html.Span(' Download PDF Report'),
+                ], id='download-report-btn', className='menu-item download-btn', n_clicks=0),
+                html.Button([
+                    html.I(className='fas fa-envelope'),
+                    html.Span(' Email PDF Report'),
+                ], id='send-report-btn', className='menu-item email-btn', n_clicks=0),
+                html.Div(id='report-action-status', className='email-status'),
+            ], className='sidebar-actions'),
+        ], className='sidebar-inner'),
     ], className='sidebar'),
     html.Div([
         html.Div([
@@ -940,7 +1183,7 @@ def update_date_range(data):
         df = pd.DataFrame(data)
         if 'Last Updated (IST)' not in df.columns:
             return None, None, None, None, True
-        dates = pd.to_datetime(df['Last Updated (IST)'], errors='coerce').dropna()
+        dates = parse_last_updated(df['Last Updated (IST)']).dropna()
         if dates.empty:
             return None, None, None, None, True
         min_d = dates.min().date()
@@ -989,86 +1232,21 @@ def update_dash(data, status, time_grp, start_date, end_date):
                 ], className='alert alert-info'),
                 "0", "0%", "0", "0", *empty,
             )
-        df = pd.DataFrame(data)
-        if 'Last Updated (IST)' in df.columns:
-            df['Date'] = pd.to_datetime(df['Last Updated (IST)'], errors='coerce')
-        fdf = apply_global_filters(df, status, start_date, end_date)
+        df, fdf, _, _ = prepare_filtered_df(
+            data, status, start_date, end_date, use_full_data_range=data_just_loaded(),
+        )
         tot = len(fdf)
+        total_loaded = len(df)
         if tot == 0:
             return (
                 html.Div('No cases match the current filters', className='alert alert-success'),
                 "0", "0%", "0", "0", *tuple(create_empty_fig("No matches") for _ in range(8)),
             )
-        succ = len(fdf[fdf['Overall Status'] == 'SUCCESS']) if 'Overall Status' in fdf.columns else 0
-        fail = len(fdf[fdf['Overall Status'] == 'FAILED']) if 'Overall Status' in fdf.columns else 0
-        unres = len(fdf[fdf['SF Final Action'] == 'Unresolved']) if 'SF Final Action' in fdf.columns else 0
-        sr = f"{(succ / tot * 100):.1f}%" if tot > 0 else "0%"
-
-        if 'Date' in fdf.columns:
-            tdf = fdf[fdf['Date'].notna()].copy()
-            if len(tdf) > 0:
-                tdf = add_period_labels(tdf, time_grp)
-                tc = tdf.groupby(['_sort', 'Period']).size().reset_index(name='Count')
-                tc = tc.sort_values('_sort')
-                trend = create_trend_chart(tc, time_grp)
-            else:
-                trend = create_empty_fig()
-        else:
-            trend = create_empty_fig()
-
-        if 'Date' in fdf.columns and 'Overall Status' in fdf.columns:
-            tdf = fdf[fdf['Date'].notna()].copy()
-            if len(tdf) > 0:
-                tdf = add_period_labels(tdf, time_grp)
-                tc = tdf.groupby(['_sort', 'Period', 'Overall Status']).size().reset_index(name='Count')
-                tc = tc.sort_values('_sort')
-                tbar = create_status_line_chart(tc, time_grp)
-            else:
-                tbar = create_empty_fig()
-        else:
-            tbar = create_empty_fig()
-
-        if 'Overall Status' in fdf.columns:
-            c = fdf['Overall Status'].value_counts()
-            status_colors = [STATUS_COLORS.get(k, CHART_PALETTE[i % len(CHART_PALETTE)])
-                             for i, k in enumerate(c.index)]
-            spie = create_donut_chart(c.to_dict(), colors=status_colors, center_label='Cases')
-        else:
-            spie = create_empty_fig()
-
-        if 'CTA Status' in fdf.columns:
-            c = fdf['CTA Status'].value_counts()
-            cpie = create_donut_chart(c.to_dict(), center_label='CTA')
-        else:
-            cpie = create_empty_fig()
-
-        if 'SF Final Category' in fdf.columns:
-            c = fdf['SF Final Category'].value_counts().head(10)
-            catbar = create_horizontal_bar(c.values, c.index, '#6366F1', '#818CF8')
-        else:
-            catbar = create_empty_fig()
-
-        if 'SF Final Problem' in fdf.columns:
-            c = fdf['SF Final Problem'].value_counts().head(10)
-            pbar = create_horizontal_bar(c.values, c.index, '#8B5CF6', '#A78BFA')
-        else:
-            pbar = create_empty_fig()
-
-        if 'SF Final Action' in fdf.columns:
-            res = len(fdf[fdf['SF Final Action'] == 'Resolved'])
-            unr = len(fdf[fdf['SF Final Action'] == 'Unresolved'])
-            resbar = create_resolution_donut(res, unr)
-        else:
-            resbar = create_empty_fig()
-
-        if 'SF Error Type' in fdf.columns:
-            e = fdf['SF Error Type'].dropna().value_counts().head(10)
-            ebar = create_error_bar(e) if len(e) > 0 else create_empty_fig()
-        else:
-            ebar = create_empty_fig()
+        tot, sr, fail, unres, succ = compute_stats(fdf)
+        trend, tbar, spie, cpie, catbar, pbar, resbar, ebar = build_all_figures(fdf, time_grp)
 
         return (
-            html.Div(f"Analyzing {tot:,} cases", className='alert alert-success'),
+            analysis_message(total_loaded, tot),
             f"{tot:,}", sr, f"{fail:,}", f"{unres:,}",
             trend, tbar, spie, cpie, catbar, pbar, resbar, ebar,
         )
@@ -1107,10 +1285,9 @@ def update_hierarchy_chart(data, status, start_date, end_date,
         return create_empty_fig("Upload data to explore hierarchy"), empty_opts, empty_opts, empty_opts, 'ALL', 'ALL'
 
     try:
-        df = pd.DataFrame(data)
-        if 'Last Updated (IST)' in df.columns:
-            df['Date'] = pd.to_datetime(df['Last Updated (IST)'], errors='coerce')
-        fdf = apply_global_filters(df, status, start_date, end_date)
+        _, fdf, _, _ = prepare_filtered_df(
+            data, status, start_date, end_date, use_full_data_range=data_just_loaded(),
+        )
 
         if not any(col in fdf.columns for col in SF_HIERARCHY.values()):
             return create_empty_fig("Hierarchy columns not found"), empty_opts, empty_opts, empty_opts, 'ALL', 'ALL'
@@ -1133,6 +1310,66 @@ def update_hierarchy_chart(data, status, start_date, end_date,
         return fig, problem_opts, detail_opts, subdetail_opts, detail_f, subdetail_f
     except Exception:
         return create_empty_fig("Unable to build hierarchy chart"), empty_opts, empty_opts, empty_opts, 'ALL', 'ALL'
+
+
+@app.callback(
+    Output('download-report', 'data'),
+    Input('download-report-btn', 'n_clicks'),
+    [
+        State('stored-data', 'data'),
+        State('status-filter', 'value'),
+        State('time-grouping', 'value'),
+        State('date-range-filter', 'start_date'),
+        State('date-range-filter', 'end_date'),
+    ],
+    prevent_initial_call=True,
+)
+def download_report(n_clicks, data, status, time_grp, start_date, end_date):
+    if not n_clicks:
+        return None
+    pdf_bytes, filename = generate_report_pdf(data, status, time_grp, start_date, end_date)
+    return dcc.send_bytes(pdf_bytes, filename)
+
+
+@app.callback(
+    Output('report-action-status', 'children'),
+    [
+        Input('download-report-btn', 'n_clicks'),
+        Input('send-report-btn', 'n_clicks'),
+    ],
+    [
+        State('stored-data', 'data'),
+        State('status-filter', 'value'),
+        State('time-grouping', 'value'),
+        State('date-range-filter', 'start_date'),
+        State('date-range-filter', 'end_date'),
+    ],
+    prevent_initial_call=True,
+)
+def report_action_status(download_clicks, email_clicks, data, status, time_grp, start_date, end_date):
+    from dash import ctx
+    from report_service import email_configured, email_setup_hint, send_report_email
+
+    triggered = ctx.triggered_id
+    if not triggered:
+        return ''
+
+    try:
+        if triggered == 'download-report-btn':
+            _, filename = generate_report_pdf(data, status, time_grp, start_date, end_date)
+            return html.Div(f'Downloaded {filename}', className='report-status success')
+
+        if not email_configured():
+            return html.Div([
+                html.Div('Email not configured.', className='report-status error'),
+                html.Div(email_setup_hint(), style={'marginTop': '6px', 'fontSize': '10px', 'lineHeight': '1.4'}),
+            ])
+
+        pdf_bytes, _ = generate_report_pdf(data, status, time_grp, start_date, end_date)
+        recipients = send_report_email(pdf_bytes)
+        return html.Div(f'Report sent to {", ".join(recipients)}', className='report-status success')
+    except Exception as e:
+        return html.Div(f'Failed: {str(e)}', className='report-status error')
 
 
 server = app.server
