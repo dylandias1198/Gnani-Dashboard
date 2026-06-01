@@ -20,30 +20,38 @@ def get_email_provider():
     explicit = os.environ.get('EMAIL_PROVIDER', '').strip().lower()
     if explicit:
         return explicit
-    if os.environ.get('SENDGRID_API_KEY'):
+    if os.environ.get('SENDGRID_API_KEY', '').strip():
         return 'sendgrid'
-    if os.environ.get('RESEND_API_KEY'):
+    if os.environ.get('RESEND_API_KEY', '').strip():
         return 'resend'
-    if os.environ.get('SMTP_USER') and os.environ.get('SMTP_PASSWORD'):
+    if os.environ.get('SMTP_USER', '').strip() and os.environ.get('SMTP_PASSWORD', '').strip():
         return 'smtp'
     return None
 
 
 def email_configured():
-    return get_email_provider() is not None
+    provider = get_email_provider()
+    if provider == 'sendgrid':
+        return bool(os.environ.get('SENDGRID_API_KEY', '').strip())
+    if provider == 'resend':
+        return bool(os.environ.get('RESEND_API_KEY', '').strip())
+    if provider == 'smtp':
+        return bool(os.environ.get('SMTP_USER', '').strip() and os.environ.get('SMTP_PASSWORD', '').strip())
+    return False
 
 
 def email_setup_hint():
     provider = get_email_provider()
     if provider == 'sendgrid':
-        return 'SendGrid API is configured.'
+        from_addr = os.environ.get('EMAIL_FROM', '').strip() or '(EMAIL_FROM not set)'
+        return f'Using SendGrid. Sender: {from_addr}'
     if provider == 'resend':
-        return 'Resend API is configured.'
+        return 'Using Resend API.'
     if provider == 'smtp':
-        return 'SMTP is configured.'
+        return f"Using SMTP ({os.environ.get('SMTP_HOST', 'smtp.office365.com')}). SendGrid dashboard will show 0 requests."
     return (
-        'Set one option in Render → Environment: '
-        'SENDGRID_API_KEY, RESEND_API_KEY, or SMTP_USER + SMTP_PASSWORD.'
+        'Set Render env vars: SENDGRID_API_KEY + EMAIL_FROM + REPORT_RECIPIENTS. '
+        'Optional: EMAIL_PROVIDER=sendgrid'
     )
 
 
@@ -232,13 +240,25 @@ def send_via_smtp(pdf_bytes, recipients, subject, body):
         server.sendmail(sender, recipients, msg.as_string())
 
 
+def _parse_email_address(value, default_name=None):
+    value = (value or '').strip()
+    if not value:
+        raise RuntimeError('EMAIL_FROM is not configured.')
+    if '<' in value and value.endswith('>'):
+        name, email = value.rsplit('<', 1)
+        return email.rstrip('>').strip(), name.strip().strip('"') or default_name
+    return value, default_name
+
+
 def send_via_sendgrid(pdf_bytes, recipients, subject, body):
     api_key = os.environ['SENDGRID_API_KEY']
-    sender = os.environ.get('EMAIL_FROM', os.environ.get('SMTP_FROM', 'noreply@payufin.com'))
+    sender = os.environ.get('EMAIL_FROM', os.environ.get('SMTP_FROM', ''))
+    email, name = _parse_email_address(sender, 'Gnani Dashboard')
 
     payload = {
-        'personalizations': [{'to': [{'email': email} for email in recipients]}],
-        'from': {'email': sender},
+        'personalizations': [{'to': [{'email': email_addr} for email_addr in recipients]}],
+        'from': {'email': email, 'name': name},
+        'reply_to': {'email': email, 'name': name},
         'subject': subject,
         'content': [{'type': 'text/plain', 'value': body}],
         'attachments': [{
@@ -254,8 +274,14 @@ def send_via_sendgrid(pdf_bytes, recipients, subject, body):
         json=payload,
         timeout=30,
     )
+    print(
+        f'[gnani-email] SendGrid status={response.status_code} '
+        f'to={recipients} from={email} message_id={response.headers.get("X-Message-Id", "")}',
+        flush=True,
+    )
     if response.status_code >= 400:
         raise RuntimeError(f'SendGrid error ({response.status_code}): {response.text[:300]}')
+    return response.headers.get('X-Message-Id', '')
 
 
 def send_via_resend(pdf_bytes, recipients, subject, body):
@@ -293,12 +319,17 @@ def send_report_email(pdf_bytes, subject=None, body=None):
 
     subject = subject or _default_subject()
     body = body or _default_body()
+    message_id = ''
 
     if provider == 'sendgrid':
-        send_via_sendgrid(pdf_bytes, recipients, subject, body)
+        message_id = send_via_sendgrid(pdf_bytes, recipients, subject, body)
     elif provider == 'resend':
         send_via_resend(pdf_bytes, recipients, subject, body)
     else:
         send_via_smtp(pdf_bytes, recipients, subject, body)
 
-    return recipients
+    return {
+        'recipients': recipients,
+        'provider': provider,
+        'message_id': message_id,
+    }

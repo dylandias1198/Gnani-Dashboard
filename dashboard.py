@@ -1378,8 +1378,26 @@ def report_action_status(download_clicks, email_clicks, data, status, time_grp, 
             ])
 
         pdf_bytes, _ = generate_report_pdf(data, status, time_grp, start_date, end_date)
-        recipients = send_report_email(pdf_bytes)
-        return html.Div(f'Report sent to {", ".join(recipients)}', className='report-status success')
+        result = send_report_email(pdf_bytes)
+        recipients = ', '.join(result['recipients'])
+        provider = result.get('provider', 'unknown')
+        provider_note = {
+            'sendgrid': 'Sent via SendGrid API — check Activity at app.sendgrid.com',
+            'smtp': 'Sent via SMTP — SendGrid dashboard will stay at 0 requests',
+            'resend': 'Sent via Resend API — check Resend dashboard, not SendGrid',
+        }.get(provider, f'Sent via {provider}')
+        return html.Div([
+            html.Div(f'Report queued to {recipients}', className='report-status success'),
+            html.Div(provider_note, style={'marginTop': '4px', 'fontSize': '11px', 'lineHeight': '1.4'}),
+            html.Div(
+                f"SendGrid message ID: {result['message_id']}",
+                style={'marginTop': '4px', 'fontSize': '10px', 'lineHeight': '1.4'},
+            ) if result.get('message_id') else None,
+            html.Div(
+                'No mail in inbox? Check spam, disable SendGrid Sandbox mode, and verify EMAIL_FROM matches your verified sender.',
+                style={'marginTop': '6px', 'fontSize': '10px', 'lineHeight': '1.4', 'color': '#94A3B8'},
+            ) if provider == 'sendgrid' else None,
+        ])
     except Exception as e:
         return html.Div(f'Failed: {str(e)}', className='report-status error')
 
