@@ -47,8 +47,101 @@ def email_setup_hint():
     )
 
 
+def _trace_color(trace, default='#6366F1'):
+    if trace.line and trace.line.color:
+        return trace.line.color
+    if trace.marker and trace.marker.color:
+        return trace.marker.color
+    return default
+
+
+def _empty_figure_message(fig):
+    if fig.layout.annotations:
+        return str(fig.layout.annotations[0].text or 'No data available')
+    return 'No data available'
+
+
+def _trace_values(values):
+    if values is None:
+        return []
+    return list(values)
+
+
+def fig_to_png_matplotlib(fig, width=880, height=360):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    dpi = 100
+    fig_mpl, ax = plt.subplots(figsize=(width / dpi, height / dpi), dpi=dpi)
+
+    if not fig.data:
+        ax.text(0.5, 0.5, _empty_figure_message(fig), ha='center', va='center')
+        ax.axis('off')
+    else:
+        pie_drawn = False
+        for trace in fig.data:
+            trace_type = trace.type
+            name = trace.name or ''
+            if trace_type == 'scatter':
+                x_vals = _trace_values(trace.x)
+                y_vals = _trace_values(trace.y)
+                if not x_vals or not y_vals:
+                    continue
+                mode = trace.mode or 'lines'
+                color = _trace_color(trace)
+                if 'lines' in mode:
+                    ax.plot(x_vals, y_vals, label=name, color=color, linewidth=2, marker='o', markersize=4)
+                elif 'markers' in mode:
+                    ax.plot(x_vals, y_vals, 'o', label=name, color=color)
+                if trace.text:
+                    for x_val, y_val, label in zip(_trace_values(trace.x), _trace_values(trace.y), _trace_values(trace.text)):
+                        if label:
+                            ax.annotate(str(label), (x_val, y_val), fontsize=7, ha='center', va='bottom')
+            elif trace_type == 'bar':
+                if getattr(trace, 'orientation', None) == 'h':
+                    ax.barh(_trace_values(trace.y), _trace_values(trace.x), label=name, color=_trace_color(trace, '#818CF8'))
+                else:
+                    ax.bar(_trace_values(trace.x), _trace_values(trace.y), label=name, color=_trace_color(trace, '#818CF8'))
+            elif trace_type == 'pie' and not pie_drawn:
+                labels = _trace_values(trace.labels)
+                values = _trace_values(trace.values)
+                if not values:
+                    continue
+                colors = trace.marker.colors if trace.marker and trace.marker.colors else None
+                hole = trace.hole or 0
+                wedgeprops = {'width': 1 - hole} if hole else None
+                ax.pie(values, labels=labels, colors=colors, startangle=90, wedgeprops=wedgeprops)
+                pie_drawn = True
+
+        if not pie_drawn:
+            x_title = fig.layout.xaxis.title.text if fig.layout.xaxis and fig.layout.xaxis.title else ''
+            y_title = fig.layout.yaxis.title.text if fig.layout.yaxis and fig.layout.yaxis.title else ''
+            if x_title:
+                ax.set_xlabel(x_title)
+            if y_title:
+                ax.set_ylabel(y_title)
+            if fig.layout.yaxis and fig.layout.yaxis.ticksuffix:
+                ax.yaxis.set_major_formatter(
+                    plt.FuncFormatter(lambda val, _: f'{val:.0f}{fig.layout.yaxis.ticksuffix}')
+                )
+            handles, labels = ax.get_legend_handles_labels()
+            if labels:
+                ax.legend(loc='best', fontsize=8)
+            ax.grid(True, alpha=0.25)
+            plt.xticks(rotation=25, ha='right', fontsize=8)
+
+    buf = io.BytesIO()
+    fig_mpl.savefig(buf, format='png', bbox_inches='tight', facecolor='white')
+    plt.close(fig_mpl)
+    return buf.getvalue()
+
+
 def fig_to_png(fig, width=880, height=360):
-    return fig.to_image(format='png', width=width, height=height, engine='kaleido')
+    try:
+        return fig.to_image(format='png', width=width, height=height, engine='kaleido')
+    except Exception:
+        return fig_to_png_matplotlib(fig, width=width, height=height)
 
 
 def build_pdf_report(summary, charts, filters=None):

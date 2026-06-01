@@ -418,14 +418,16 @@ def generate_report_pdf(data, status, time_grp, start_date, end_date):
     tot, sr, fail, unres, succ = compute_stats(fdf)
     figures = build_all_figures(fdf, time_grp)
     charts = []
+    chart_errors = []
     for title, fig in zip(CHART_TITLES, figures):
         try:
             charts.append((title, fig_to_png(fig)))
-        except Exception:
-            continue
+        except Exception as exc:
+            chart_errors.append(f'{title}: {exc}')
 
     if not charts:
-        raise ValueError('Could not generate chart images for PDF.')
+        detail = chart_errors[0] if chart_errors else 'unknown error'
+        raise ValueError(f'Could not generate chart images for PDF ({detail}).')
 
     summary = {
         'generated_at': datetime.now().strftime('%b %d, %Y %H:%M'),

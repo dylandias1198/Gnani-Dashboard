@@ -3,7 +3,7 @@ services:
     name: gnani-dashboard
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && (command -v kaleido_get_chrome >/dev/null && kaleido_get_chrome || true)
     startCommand: gunicorn dashboard:server --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
     envVars:
       - key: PYTHON_VERSION
