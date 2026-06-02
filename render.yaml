@@ -8,3 +8,22 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.0
+
+  # Cron: default 12:00 IST (06:30 UTC). Change schedule to match CRON_SCHEDULE / your time.
+  - type: cron
+    name: gnani-scheduled-report
+    runtime: python
+    schedule: "30 6 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scheduled_job.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: INBOX_PROVIDER
+        value: graph
+      - key: EMAIL_PROVIDER
+        value: graph
+      - key: INBOX_TODAY_ONLY
+        value: "true"
+      - key: MAILBOX_TIMEZONE
+        value: Asia/Kolkata

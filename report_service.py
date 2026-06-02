@@ -10,6 +10,8 @@ from email.mime.text import MIMEText
 
 import requests
 
+from graph_service import send_graph_mail
+
 
 def get_report_recipients():
     raw = os.environ.get('REPORT_RECIPIENTS', 'dylan.dias@payufin.com')
@@ -20,6 +22,11 @@ def get_email_provider():
     explicit = os.environ.get('EMAIL_PROVIDER', '').strip().lower()
     if explicit:
         return explicit
+    if (
+        os.environ.get('AZURE_TENANT_ID', '').strip()
+        and os.environ.get('AZURE_CLIENT_SECRET', '').strip()
+    ):
+        return 'graph'
     if os.environ.get('SENDGRID_API_KEY', '').strip():
         return 'sendgrid'
     if os.environ.get('RESEND_API_KEY', '').strip():
@@ -31,6 +38,16 @@ def get_email_provider():
 
 def email_configured():
     provider = get_email_provider()
+    if provider == 'graph':
+        return bool(
+            os.environ.get('AZURE_TENANT_ID', '').strip()
+            and os.environ.get('AZURE_CLIENT_SECRET', '').strip()
+            and os.environ.get('AZURE_CLIENT_ID', '').strip()
+            and (
+                os.environ.get('MAILBOX_USER', '').strip()
+                or os.environ.get('EMAIL_FROM', '').strip()
+            )
+        )
     if provider == 'sendgrid':
         return bool(os.environ.get('SENDGRID_API_KEY', '').strip())
     if provider == 'resend':
@@ -42,6 +59,8 @@ def email_configured():
 
 def email_setup_hint():
     provider = get_email_provider()
+    if provider == 'graph':
+        return 'Using Microsoft Graph (Mail.Send). Set AZURE_* and MAILBOX_USER.'
     if provider == 'sendgrid':
         from_addr = os.environ.get('EMAIL_FROM', '').strip() or '(EMAIL_FROM not set)'
         return f'Using SendGrid. Sender: {from_addr}'
@@ -110,7 +129,12 @@ def fig_to_png_matplotlib(fig, width=880, height=360):
                 if getattr(trace, 'orientation', None) == 'h':
                     ax.barh(_trace_values(trace.y), _trace_values(trace.x), label=name, color=_trace_color(trace, '#818CF8'))
                 else:
-                    ax.bar(_trace_values(trace.x), _trace_values(trace.y), label=name, color=_trace_color(trace, '#818CF8'))
+                    x_vals = _trace_values(trace.x)
+                    y_vals = _trace_values(trace.y)
+                    ax.bar(range(len(x_vals)), y_vals, label=name, color=_trace_color(trace, '#818CF8'))
+                    tick_fs = 5 if max((len(str(x)) for x in x_vals), default=0) > 28 else 7
+                    ax.set_xticks(range(len(x_vals)))
+                    ax.set_xticklabels(x_vals, rotation=40, ha='right', fontsize=tick_fs)
             elif trace_type == 'pie' and not pie_drawn:
                 labels = _trace_values(trace.labels)
                 values = _trace_values(trace.values)
@@ -137,10 +161,11 @@ def fig_to_png_matplotlib(fig, width=880, height=360):
             if labels:
                 ax.legend(loc='best', fontsize=8)
             ax.grid(True, alpha=0.25)
-            plt.xticks(rotation=25, ha='right', fontsize=8)
+            if not any(getattr(t, 'type', None) == 'bar' and getattr(t, 'orientation', None) != 'h' for t in fig.data):
+                plt.xticks(rotation=25, ha='right', fontsize=8)
 
     buf = io.BytesIO()
-    fig_mpl.savefig(buf, format='png', bbox_inches='tight', facecolor='white')
+    fig_mpl.savefig(buf, format='png', bbox_inches='tight', facecolor='white', pad_inches=0.15)
     plt.close(fig_mpl)
     return buf.getvalue()
 
@@ -152,50 +177,162 @@ def fig_to_png(fig, width=880, height=360):
         return fig_to_png_matplotlib(fig, width=width, height=height)
 
 
+# Bar charts with long category labels need full width + taller export in PDF.
+PDF_FULL_WIDTH_CHARTS = frozenset({
+    'SF Final Categories',
+    'SF Final Problems',
+    'Resolution Status',
+    'Error Types',
+})
+
+
+def _pdf_compact_layout():
+    """Layout tuning for multi-chart pages (mm). Override via env if needed."""
+    margin = float(os.environ.get('PDF_MARGIN_MM', '8'))
+    cols = int(os.environ.get('PDF_CHART_COLUMNS', '2'))
+    col_w = float(os.environ.get('PDF_CHART_WIDTH_MM', '92'))
+    max_col_h = float(os.environ.get('PDF_CHART_MAX_HEIGHT_MM', '52'))
+    max_wide_h = float(os.environ.get('PDF_WIDE_CHART_MAX_HEIGHT_MM', '78'))
+    title_h = float(os.environ.get('PDF_CHART_TITLE_MM', '4'))
+    return margin, max(1, cols), col_w, max_col_h, max_wide_h, title_h
+
+
+def _png_height_mm(png_bytes, width_mm, max_height_mm):
+    """Preserve PNG aspect ratio so vertical bar charts are not squashed flat."""
+    import struct
+    if len(png_bytes) >= 24 and png_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+        width_px = struct.unpack('>I', png_bytes[16:20])[0]
+        height_px = struct.unpack('>I', png_bytes[20:24])[0]
+        if width_px > 0 and height_px > 0:
+            height_mm = width_mm * height_px / width_px
+            return min(height_mm, max_height_mm)
+    return min(width_mm * 0.45, max_height_mm)
+
+
+def _write_pdf_chart_block(pdf, x, y, title, png_bytes, img_w, max_img_h, title_h):
+    pdf.set_xy(x, y)
+    pdf.set_font('Helvetica', 'B', 8)
+    pdf.set_text_color(15, 23, 42)
+    pdf.cell(img_w, title_h, title[:48], ln=0)
+    img_h = _png_height_mm(png_bytes, img_w, max_img_h)
+    with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+        tmp.write(png_bytes)
+        tmp_path = tmp.name
+    try:
+        pdf.image(tmp_path, x=x, y=y + title_h, w=img_w, h=img_h)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    return title_h + img_h
+
+
+def _normalize_chart_entry(entry):
+    if len(entry) == 3:
+        title, png_bytes, meta = entry
+        return title, png_bytes, meta or {}
+    title, png_bytes = entry
+    full_width = title in PDF_FULL_WIDTH_CHARTS
+    return title, png_bytes, {'full_width': full_width}
+
+
 def build_pdf_report(summary, charts, filters=None):
     from fpdf import FPDF
 
+    margin, cols, col_img_w, max_col_h, max_wide_h, title_h = _pdf_compact_layout()
+    col_gap = 4
+    row_gap = 4
+    page_bottom = 287
+
     pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=14)
+    pdf.set_margins(margin, margin, margin)
+    pdf.set_auto_page_break(auto=False)
     pdf.add_page()
 
-    pdf.set_font('Helvetica', 'B', 18)
-    pdf.cell(0, 10, 'Gnani Dashboard Report', ln=True)
-    pdf.set_font('Helvetica', '', 10)
+    pdf.set_font('Helvetica', 'B', 14)
+    pdf.set_text_color(15, 23, 42)
+    pdf.cell(0, 7, 'Gnani Dashboard Report', ln=True)
+    pdf.set_font('Helvetica', '', 8)
     pdf.set_text_color(100, 116, 139)
-    pdf.cell(0, 6, f"Generated: {summary.get('generated_at', datetime.now().strftime('%b %d, %Y %H:%M'))}", ln=True)
-    pdf.ln(4)
+    pdf.cell(0, 4, f"Generated: {summary.get('generated_at', datetime.now().strftime('%b %d, %Y %H:%M'))}", ln=True)
+    pdf.ln(2)
     pdf.set_text_color(15, 23, 42)
 
-    pdf.set_font('Helvetica', 'B', 12)
-    pdf.cell(0, 8, 'Summary', ln=True)
-    pdf.set_font('Helvetica', '', 11)
-    for label, value in summary.get('metrics', []):
-        pdf.cell(0, 7, f'{label}: {value}', ln=True)
+    metrics = summary.get('metrics', [])
+    if metrics:
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.cell(0, 5, 'Summary', ln=True)
+        pdf.set_font('Helvetica', '', 8)
+        half = (len(metrics) + 1) // 2
+        left_x = margin
+        right_x = margin + (pdf.w - 2 * margin) / 2
+        y0 = pdf.get_y()
+        for index, (label, value) in enumerate(metrics):
+            x = left_x if index < half else right_x
+            row = index if index < half else index - half
+            pdf.set_xy(x, y0 + row * 4.5)
+            pdf.cell(85, 4.5, f'{label}: {value}', ln=0)
+        pdf.set_y(y0 + half * 4.5 + 2)
 
     if filters:
-        pdf.ln(2)
-        pdf.set_font('Helvetica', 'B', 12)
-        pdf.cell(0, 8, 'Filters Applied', ln=True)
-        pdf.set_font('Helvetica', '', 10)
-        for label, value in filters.items():
-            pdf.cell(0, 6, f'{label}: {value}', ln=True)
+        pdf.set_font('Helvetica', 'B', 9)
+        pdf.cell(0, 5, 'Filters', ln=True)
+        pdf.set_font('Helvetica', '', 7)
+        filter_line = '  |  '.join(f'{label}: {value}' for label, value in filters.items())
+        pdf.multi_cell(0, 3.5, filter_line)
+        pdf.ln(1)
 
-    for title, png_bytes in charts:
-        pdf.add_page()
-        pdf.set_font('Helvetica', 'B', 13)
-        pdf.cell(0, 8, title, ln=True)
-        pdf.ln(2)
-        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-            tmp.write(png_bytes)
-            tmp_path = tmp.name
-        try:
-            pdf.image(tmp_path, w=190)
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+    usable_w = pdf.w - 2 * margin
+    col_img_w = min(col_img_w, (usable_w - (cols - 1) * col_gap) / cols)
+    x_cols = [margin + i * (col_img_w + col_gap) for i in range(cols)]
+    row_y = pdf.get_y() + 2
+    col_idx = 0
+    row_block_h = 0
+
+    def ensure_space(needed_h):
+        nonlocal row_y, col_idx, row_block_h
+        if row_y + needed_h > page_bottom:
+            pdf.add_page()
+            row_y = margin + 2
+            col_idx = 0
+            row_block_h = 0
+
+    for entry in charts:
+        title, png_bytes, meta = _normalize_chart_entry(entry)
+        full_width = meta.get('full_width', title in PDF_FULL_WIDTH_CHARTS)
+
+        if full_width:
+            if col_idx != 0:
+                row_y += row_block_h + row_gap
+                col_idx = 0
+                row_block_h = 0
+            est_h = title_h + _png_height_mm(png_bytes, usable_w, max_wide_h)
+            ensure_space(est_h)
+            block_h = _write_pdf_chart_block(
+                pdf, margin, row_y, title, png_bytes, usable_w, max_wide_h, title_h,
+            )
+            row_y += block_h + row_gap
+            col_idx = 0
+            row_block_h = 0
+            continue
+
+        est_h = title_h + _png_height_mm(png_bytes, col_img_w, max_col_h) + 2
+        if col_idx == 0:
+            ensure_space(est_h)
+        x = x_cols[col_idx]
+        block_h = _write_pdf_chart_block(
+            pdf, x, row_y, title, png_bytes, col_img_w, max_col_h, title_h,
+        )
+        row_block_h = max(row_block_h, block_h)
+        col_idx += 1
+        if col_idx >= cols:
+            row_y += row_block_h + row_gap
+            col_idx = 0
+            row_block_h = 0
+
+    if col_idx != 0:
+        row_y += row_block_h
 
     out = io.BytesIO()
     pdf.output(out)
@@ -308,6 +445,35 @@ def send_via_resend(pdf_bytes, recipients, subject, body):
         raise RuntimeError(f'Resend error ({response.status_code}): {response.text[:300]}')
 
 
+def send_via_graph(pdf_bytes, recipients, subject, body):
+    attachments = [{
+        'name': _pdf_attachment_name(),
+        'content_bytes': pdf_bytes,
+        'content_type': 'application/pdf',
+    }]
+    return send_graph_mail(recipients, subject, body, attachments=attachments)
+
+
+def send_no_data_email():
+    """Notify recipients when today's data email was not found in the inbox."""
+    from graph_service import mailbox_timezone, today_received_bounds_utc
+
+    _, _, day_label = today_received_bounds_utc()
+    sender = os.environ.get('MAIL_SENDER_FILTER', 'the configured sender')
+    tz = mailbox_timezone()
+    subject = f'Gnani Dashboard — No data found ({day_label})'
+    body = (
+        f'No data file was found for today ({day_label}, timezone {tz}).\n\n'
+        f'The scheduled job checked the inbox for mail from:\n  {sender}\n\n'
+        'Expected: an Excel or CSV attachment received today.\n'
+        'No report PDF is attached.\n'
+    )
+    recipients = get_report_recipients()
+    if not recipients:
+        raise RuntimeError('No report recipients configured.')
+    return send_graph_mail(recipients, subject, body)
+
+
 def send_report_email(pdf_bytes, subject=None, body=None):
     provider = get_email_provider()
     if not provider:
@@ -321,6 +487,9 @@ def send_report_email(pdf_bytes, subject=None, body=None):
     body = body or _default_body()
     message_id = ''
 
+    if provider == 'graph':
+        result = send_via_graph(pdf_bytes, recipients, subject, body)
+        return {**result, 'message_id': message_id}
     if provider == 'sendgrid':
         message_id = send_via_sendgrid(pdf_bytes, recipients, subject, body)
     elif provider == 'resend':

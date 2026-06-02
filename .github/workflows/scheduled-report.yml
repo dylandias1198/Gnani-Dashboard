@@ -1,0 +1,31 @@
+name: Scheduled Gnani Report
+
+on:
+  schedule:
+    # 12:00 IST = 06:30 UTC — edit to match your preferred run time
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run scheduled report (Azure Graph)
+        env:
+          INBOX_PROVIDER: graph
+          EMAIL_PROVIDER: graph
+          INBOX_TODAY_ONLY: 'true'
+          MAILBOX_TIMEZONE: Asia/Kolkata
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          MAILBOX_USER: ${{ secrets.MAILBOX_USER }}
+          MAIL_SENDER_FILTER: ${{ secrets.MAIL_SENDER_FILTER }}
+          REPORT_RECIPIENTS: ${{ secrets.REPORT_RECIPIENTS }}
+        run: python scheduled_job.py

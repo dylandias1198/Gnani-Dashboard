@@ -44,22 +44,91 @@ GitHub cannot run a Dash server itself. Actions can **test your code** and **tri
 | Workflow | What it does |
 |----------|----------------|
 | `ci.yml` | Installs deps and verifies `dashboard.py` imports (on push/PR) |
-| `deploy-render.yml` | Runs tests, then POSTs to Render deploy hook |
+| `scheduled-report.yml` | Daily inbox → PDF → email (cron) |
 
 View runs: **GitHub repo → Actions** tab.
 
-### Push workflow files with your PAT
+## Scheduled automation (Azure Graph only)
+
+`scheduled_job.py` runs on a **cron schedule** and uses **only Microsoft Graph** (no SendGrid):
+
+1. Checks the inbox for mail **received today** (timezone `MAILBOX_TIMEZONE`, default `Asia/Kolkata`) from `MAIL_SENDER_FILTER` with an Excel/CSV attachment  
+2. **If found:** loads data, generates PDF, emails `REPORT_RECIPIENTS` via Graph `Mail.Send`  
+3. **If not found:** emails recipients **“No data found”** for that day (no PDF)  
+
+### Azure app permissions (IT)
+
+Application permissions (admin consent required):
+
+| Permission | Purpose |
+|------------|---------|
+| `Mail.Read` | Read inbox and download attachments |
+| `Mail.Send` | Send report and no-data notifications |
+
+### Required env vars (Render cron or GitHub secrets)
+
+| Variable | Example |
+|----------|---------|
+| `INBOX_PROVIDER` | `graph` |
+| `EMAIL_PROVIDER` | `graph` |
+| `AZURE_TENANT_ID` | tenant ID |
+| `AZURE_CLIENT_ID` | app client ID |
+| `AZURE_CLIENT_SECRET` | app secret |
+| `MAILBOX_USER` | `you@payufin.com` (inbox + send-as) |
+| `MAIL_SENDER_FILTER` | `reports@payufin.com` |
+| `REPORT_RECIPIENTS` | `a@payufin.com,b@payufin.com` |
+| `MAILBOX_TIMEZONE` | `Asia/Kolkata` |
+| `INBOX_TODAY_ONLY` | `true` (only today’s mail) |
+
+### Cron time
+
+Default in `render.yaml` and GitHub Actions: **`30 6 * * *` UTC** ≈ **12:00 IST**.
+
+To run at another time, change the cron expression:
+
+| Local time (IST) | UTC cron (`render.yaml` / GitHub) |
+|------------------|-----------------------------------|
+| 09:00 IST | `30 3 * * *` |
+| 12:00 IST | `30 6 * * *` |
+| 18:00 IST | `30 12 * * *` |
+
+Cron uses UTC. Formula: **UTC hour = IST hour − 5:30** (e.g. 9:00 IST → 03:30 UTC → `30 3 * * *`).
+
+### Run manually
 
 ```bash
-cd /Users/dylan.dias/PycharmProjects/gnanni
-git add .github/workflows/
-git commit -m "Add GitHub Actions for CI and Render deploy"
-git push origin main
+export INBOX_PROVIDER=graph EMAIL_PROVIDER=graph
+export AZURE_TENANT_ID=... AZURE_CLIENT_ID=... AZURE_CLIENT_SECRET=...
+export MAILBOX_USER=you@payufin.com MAIL_SENDER_FILTER=sender@payufin.com
+export REPORT_RECIPIENTS=you@payufin.com
+
+# Dry run (no email)
+SCHEDULE_DRY_RUN=true python scheduled_job.py
+
+# Full run
+python scheduled_job.py
 ```
 
-Use GitHub username + PAT (`ghp_...`) when prompted for password.
+### Schedule options
 
-## CSV format
+| Method | Config |
+|--------|--------|
+| **Render Cron** | `gnani-scheduled-report` in `render.yaml` |
+| **GitHub Actions** | `.github/workflows/scheduled-report.yml` |
+| **Local cron** | `30 6 * * * cd /path/to/gnanni && .venv/bin/python scheduled_job.py` |
+
+### Optional
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `INBOX_ONLY_UNREAD` | `true` | Only unread messages |
+| `REPORT_TIME_GROUPING` | `daily` | PDF chart grouping |
+| `REPORT_STATUS_FILTER` | `ALL` | Status filter in PDF |
+| `MARK_PROCESSED` | `true` | Mark message read after processing |
+
+Supported attachments: `.xlsx`, `.xls`, `.csv`
+
+## CSV / Excel format
 
 The dashboard expects columns such as:
 

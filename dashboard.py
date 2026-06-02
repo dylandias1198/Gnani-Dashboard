@@ -412,7 +412,7 @@ CHART_TITLES = [
 ]
 
 
-def generate_report_pdf(data, status, time_grp, start_date, end_date):
+def generate_report_pdf(data, status, time_grp, start_date, end_date, use_full_data_range=False):
     from datetime import datetime
     from report_service import build_pdf_report, fig_to_png
 
@@ -420,7 +420,7 @@ def generate_report_pdf(data, status, time_grp, start_date, end_date):
         raise ValueError('Upload data before generating a report.')
 
     df, fdf, start_date, end_date = prepare_filtered_df(
-        data, status, start_date, end_date, use_full_data_range=False,
+        data, status, start_date, end_date, use_full_data_range=use_full_data_range,
     )
     if len(fdf) == 0:
         raise ValueError('No data matches current filters.')
@@ -429,9 +429,19 @@ def generate_report_pdf(data, status, time_grp, start_date, end_date):
     figures = build_all_figures(fdf, time_grp)
     charts = []
     chart_errors = []
+    default_w = int(os.environ.get('PDF_CHART_PX_WIDTH', '520'))
+    default_h = int(os.environ.get('PDF_CHART_PX_HEIGHT', '200'))
+    wide_w = int(os.environ.get('PDF_WIDE_CHART_PX_WIDTH', '900'))
+    wide_h = int(os.environ.get('PDF_WIDE_CHART_PX_HEIGHT', '380'))
+
     for title, fig in zip(CHART_TITLES, figures):
         try:
-            charts.append((title, fig_to_png(fig)))
+            layout_h = getattr(fig.layout, 'height', None) or default_h
+            if title in ('SF Final Categories', 'SF Final Problems', 'Resolution Status', 'Error Types'):
+                width, height = wide_w, max(wide_h, min(420, int(layout_h * 0.72)))
+                charts.append((title, fig_to_png(fig, width=width, height=height), {'full_width': True}))
+            else:
+                charts.append((title, fig_to_png(fig, width=default_w, height=default_h)))
         except Exception as exc:
             chart_errors.append(f'{title}: {exc}')
 
